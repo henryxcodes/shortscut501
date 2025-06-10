@@ -3,4 +3,7 @@ services:
     name: silence-cutter-api
     env: python
     buildCommand: pip install -r requirements.txt
-    startCommand: python app.py 
+    startCommand: python3 app.py
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11.11" 
