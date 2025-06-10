@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, Response
 from pydub import AudioSegment
 from pydub.silence import detect_nonsilent, split_on_silence
 import os
@@ -181,29 +181,48 @@ def process_audio():
     # Output will be MP3 instead of WAV
     output_path = input_path.replace('.wav', '_processed.mp3')
     
-    # Create job and return immediately
-    job_id = str(uuid.uuid4())
-    jobs[job_id] = {
-        'id': job_id,
-        'status': 'pending',
-        'filename': file.filename,
-        'input_path': input_path,
-        'created_at': datetime.now()
-    }
-    
-    # Start background processing
-    thread = threading.Thread(target=process_audio_background, args=(job_id, input_path, output_path))
-    thread.daemon = True
-    thread.start()
-    
-    logger.info(f"[{request_id}] Job {job_id} created and processing started")
-    
-    return jsonify({
-        'success': True,
-        'job_id': job_id,
-        'status': 'pending',
-        'message': f'Audio processing started. Use GET /job/{job_id} to check status.'
-    }), 200
+    try:
+        # Process synchronously (no background thread)
+        logger.info(f"[{request_id}] Starting synchronous processing")
+        
+        # Process the audio
+        processed_audio = cut_silence(input_path)
+        
+        # Export as MP3 with size limit
+        export_mp3_with_size_limit(processed_audio, output_path)
+        logger.info(f"[{request_id}] Exported processed audio to: {output_path}")
+        
+        # Return the processed file directly
+        if os.path.exists(output_path):
+            file_size = os.path.getsize(output_path)
+            logger.info(f"[{request_id}] Returning MP3 file, size: {file_size/1024/1024:.2f}MB")
+            
+            with open(output_path, 'rb') as f:
+                audio_data = f.read()
+            
+            # Clean up files
+            os.unlink(input_path)
+            os.unlink(output_path)
+            
+            return Response(
+                audio_data,
+                mimetype='audio/mpeg',
+                headers={
+                    'Content-Disposition': f'attachment; filename={file.filename.rsplit(".", 1)[0]}_processed.mp3'
+                }
+            )
+        else:
+            logger.error(f"[{request_id}] Processed file not found")
+            return jsonify({'error': 'Processed file not found'}), 500
+            
+    except Exception as e:
+        logger.error(f"[{request_id}] Error processing audio: {str(e)}")
+        # Clean up on error
+        if os.path.exists(input_path):
+            os.unlink(input_path)
+        if os.path.exists(output_path):
+            os.unlink(output_path)
+        return jsonify({'error': f'Processing failed: {str(e)}'}), 500
 
 @app.route('/job/<job_id>', methods=['GET'])
 def get_job_status(job_id):
