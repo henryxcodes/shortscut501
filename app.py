@@ -157,11 +157,11 @@ def process_audio():
     request_id = datetime.now().strftime('%Y%m%d_%H%M%S')
     logger.info(f"[{request_id}] Received new request")
     
-    if 'audio' not in request.files:
-        logger.error(f"[{request_id}] No audio file provided in request")
-        return jsonify({'error': 'No audio file provided'}), 400
+    if 'file' not in request.files:
+        logger.error(f"[{request_id}] No file provided in request")
+        return jsonify({'error': 'No file provided'}), 400
     
-    file = request.files['audio']
+    file = request.files['file']
     if file.filename == '':
         logger.error(f"[{request_id}] Empty filename")
         return jsonify({'error': 'No file selected'}), 400
