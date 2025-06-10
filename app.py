@@ -1,70 +1,263 @@
-from flask import Flask, request, jsonify, send_file
+from flask import Flask, request, jsonify
 from pydub import AudioSegment
-from pydub.silence import split_on_silence
-import tempfile
+from pydub.silence import detect_nonsilent, split_on_silence
 import os
-import io
-from werkzeug.utils import secure_filename
+import tempfile
 import logging
+from datetime import datetime
+import threading
+import uuid
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler('silence_cutter.log')
+    ]
+)
+logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+# Job storage (same pattern as Claude API)
+jobs = {}
 
-# Configuration
-UPLOAD_FOLDER = 'temp_uploads'
-ALLOWED_EXTENSIONS = {'mp3', 'wav', 'flac', 'm4a', 'aac', 'ogg'}
-MAX_CONTENT_LENGTH = 50 * 1024 * 1024  # 50MB max file size
+# File size limit in bytes (50MB)
+MAX_FILE_SIZE = 50 * 1024 * 1024
 
-app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
-app.config['MAX_CONTENT_LENGTH'] = MAX_CONTENT_LENGTH
-
-# Silence cutting parameters
-MIN_SILENCE_LEN = 45  # minimum length of silence in milliseconds
-SILENCE_THRESH = -45  # threshold in dB below which audio is considered silence
-KEEP_SILENCE = 30     # amount of silence to keep around non-silent parts in milliseconds
-
-def allowed_file(filename):
-    return '.' in filename and \
-           filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
-
-def process_audio(audio_file_path, output_format='mp3'):
-    """
-    Process audio file by cutting silence using the specified parameters
-    """
+def cut_silence(audio_path, min_silence_len=45, silence_thresh=-45, keep_silence=30):
+    logger.info(f"Processing audio file: {audio_path}")
+    logger.info(f"Parameters: min_silence_len={min_silence_len}ms, silence_thresh={silence_thresh}dB, keep_silence={keep_silence}ms")
+    
+    # Load the audio file
     try:
-        # Load audio file
-        audio = AudioSegment.from_file(audio_file_path)
-        logger.info(f"Loaded audio file: duration={len(audio)}ms")
-        
-        # Split audio on silence
+        audio = AudioSegment.from_file(audio_path)
+        logger.info(f"Audio loaded successfully. Duration: {len(audio)/1000:.2f} seconds")
+    except Exception as e:
+        logger.error(f"Error loading audio file: {str(e)}")
+        raise
+    
+    # Split audio on silence, keeping short silences as padding
+    try:
         chunks = split_on_silence(
             audio,
-            min_silence_len=MIN_SILENCE_LEN,
-            silence_thresh=SILENCE_THRESH,
-            keep_silence=KEEP_SILENCE
+            min_silence_len=min_silence_len,
+            silence_thresh=silence_thresh,
+            keep_silence=keep_silence
         )
-        
-        logger.info(f"Split audio into {len(chunks)} chunks")
-        
         if not chunks:
-            logger.warning("No audio chunks found, returning original audio")
+            logger.warning("No audio chunks found after splitting on silence, returning original audio.")
             return audio
-        
-        # Combine chunks back together (removes silence between them)
-        processed_audio = AudioSegment.empty()
+            
+        logger.info(f"Found {len(chunks)} chunks after splitting on silence.")
+    except Exception as e:
+        logger.error(f"Error splitting audio on silence: {str(e)}")
+        raise
+    
+    # Combine all chunks
+    try:
+        result = AudioSegment.empty()
         for chunk in chunks:
-            processed_audio += chunk
+            result += chunk
+        logger.info(f"Processed audio duration: {len(result)/1000:.2f} seconds")
+        return result
+    except Exception as e:
+        logger.error(f"Error combining audio chunks: {str(e)}")
+        raise
+
+def export_mp3_with_size_limit(audio, output_path, max_size_bytes=MAX_FILE_SIZE):
+    """Export audio as MP3 with automatic compression to stay under size limit"""
+    logger.info(f"Exporting audio to MP3 format with max size: {max_size_bytes/1024/1024:.1f}MB")
+    
+    # Start with high quality and reduce if needed
+    bitrates = [256, 192, 160, 128, 96, 64, 32]  # kbps
+    
+    for bitrate in bitrates:
+        temp_path = output_path + f"_temp_{bitrate}.mp3"
+        try:
+            # Export with current bitrate
+            audio.export(
+                temp_path, 
+                format="mp3", 
+                bitrate=f"{bitrate}k",
+                parameters=["-q:a", "2"]  # Good quality
+            )
+            
+            # Check file size
+            file_size = os.path.getsize(temp_path)
+            logger.info(f"Bitrate {bitrate}kbps produced file size: {file_size/1024/1024:.2f}MB")
+            
+            if file_size <= max_size_bytes:
+                # File is within size limit, rename to final output
+                os.rename(temp_path, output_path)
+                logger.info(f"Successfully exported MP3 at {bitrate}kbps bitrate, size: {file_size/1024/1024:.2f}MB")
+                return output_path
+            else:
+                # File too large, try next lower bitrate
+                os.unlink(temp_path)
+                
+        except Exception as e:
+            logger.error(f"Error exporting at {bitrate}kbps: {str(e)}")
+            if os.path.exists(temp_path):
+                os.unlink(temp_path)
+            continue
+    
+    # If we get here, even the lowest bitrate was too large
+    # Try one more time with extreme compression
+    try:
+        audio.export(
+            output_path, 
+            format="mp3", 
+            bitrate="24k",
+            parameters=["-q:a", "9"]  # Lowest quality but smallest size
+        )
+        file_size = os.path.getsize(output_path)
+        logger.warning(f"Used extreme compression (24kbps) - final size: {file_size/1024/1024:.2f}MB")
+        return output_path
+    except Exception as e:
+        logger.error(f"Failed to export even with extreme compression: {str(e)}")
+        raise Exception("Unable to compress audio under 50MB limit")
+
+def process_audio_background(job_id, input_path, output_path):
+    """Background processing function"""
+    try:
+        jobs[job_id]['status'] = 'processing'
+        logger.info(f"[{job_id}] Starting background processing")
         
-        logger.info(f"Processed audio: original={len(audio)}ms, processed={len(processed_audio)}ms")
+        # Process the audio (same as before)
+        processed_audio = cut_silence(input_path)
         
-        return processed_audio
+        # Export as MP3 with size limit instead of WAV
+        output_path = output_path.replace('.wav', '.mp3')  # Change extension to MP3
+        export_mp3_with_size_limit(processed_audio, output_path)
+        logger.info(f"[{job_id}] Exported processed audio to: {output_path}")
+        
+        # Update job status
+        jobs[job_id]['status'] = 'completed'
+        jobs[job_id]['output_path'] = output_path
+        jobs[job_id]['completed_at'] = datetime.now()
+        logger.info(f"[{job_id}] Processing completed successfully")
         
     except Exception as e:
-        logger.error(f"Error processing audio: {str(e)}")
-        raise
+        logger.error(f"[{job_id}] Error in background processing: {str(e)}")
+        jobs[job_id]['status'] = 'failed'
+        jobs[job_id]['error'] = str(e)
+        jobs[job_id]['completed_at'] = datetime.now()
+        
+        # Clean up on error
+        if os.path.exists(input_path):
+            os.unlink(input_path)
+        if os.path.exists(output_path):
+            os.unlink(output_path)
+
+@app.route('/process-audio', methods=['POST'])
+def process_audio():
+    request_id = datetime.now().strftime('%Y%m%d_%H%M%S')
+    logger.info(f"[{request_id}] Received new request")
+    
+    if 'audio' not in request.files:
+        logger.error(f"[{request_id}] No audio file provided in request")
+        return jsonify({'error': 'No audio file provided'}), 400
+    
+    file = request.files['audio']
+    if file.filename == '':
+        logger.error(f"[{request_id}] Empty filename")
+        return jsonify({'error': 'No file selected'}), 400
+    
+    logger.info(f"[{request_id}] Processing file: {file.filename}")
+    
+    # Create temporary files for input and output
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.wav') as input_temp:
+            file.save(input_temp.name)
+            input_path = input_temp.name
+        logger.info(f"[{request_id}] Saved input file to: {input_path}")
+    except Exception as e:
+        logger.error(f"[{request_id}] Error saving input file: {str(e)}")
+        return jsonify({'error': 'Error saving input file'}), 500
+    
+    # Output will be MP3 instead of WAV
+    output_path = input_path.replace('.wav', '_processed.mp3')
+    
+    # Create job and return immediately
+    job_id = str(uuid.uuid4())
+    jobs[job_id] = {
+        'id': job_id,
+        'status': 'pending',
+        'filename': file.filename,
+        'input_path': input_path,
+        'created_at': datetime.now()
+    }
+    
+    # Start background processing
+    thread = threading.Thread(target=process_audio_background, args=(job_id, input_path, output_path))
+    thread.daemon = True
+    thread.start()
+    
+    logger.info(f"[{request_id}] Job {job_id} created and processing started")
+    
+    return jsonify({
+        'success': True,
+        'job_id': job_id,
+        'status': 'pending',
+        'message': f'Audio processing started. Use GET /job/{job_id} to check status.'
+    }), 200
+
+@app.route('/job/<job_id>', methods=['GET'])
+def get_job_status(job_id):
+    if job_id not in jobs:
+        return jsonify({'error': 'Job not found'}), 404
+    
+    job = jobs[job_id]
+    
+    if job['status'] == 'completed':
+        # Return the processed audio file
+        output_path = job['output_path']
+        if os.path.exists(output_path):
+            file_size = os.path.getsize(output_path)
+            logger.info(f"Returning MP3 file, size: {file_size/1024/1024:.2f}MB")
+            
+            with open(output_path, 'rb') as f:
+                audio_data = f.read()
+            
+            # Clean up files after sending
+            os.unlink(job['input_path'])
+            os.unlink(output_path)
+            del jobs[job_id]  # Clean up job
+            
+            return audio_data, 200, {
+                'Content-Type': 'audio/mpeg',  # Changed to MP3 content type
+                'Content-Disposition': 'attachment; filename=processed_audio.mp3'  # Changed filename extension
+            }
+        else:
+            return jsonify({'error': 'Processed file not found'}), 500
+            
+    elif job['status'] == 'failed':
+        error_msg = job.get('error', 'Unknown error')
+        # Clean up on failure
+        if os.path.exists(job['input_path']):
+            os.unlink(job['input_path'])
+        del jobs[job_id]
+        return jsonify({'error': error_msg}), 500
+    else:
+        # Still processing
+        return jsonify({
+            'job_id': job_id,
+            'status': job['status'],
+            'filename': job['filename'],
+            'created_at': job['created_at'].isoformat(),
+            'message': 'Audio processing in progress...'
+        }), 200
+
+@app.route('/health', methods=['GET'])
+def health_check():
+    return jsonify({
+        'status': 'healthy',
+        'timestamp': datetime.now().isoformat(),
+        'active_jobs': len([j for j in jobs.values() if j['status'] in ['pending', 'processing']])
+    })
 
 @app.route('/', methods=['GET'])
 def home():
@@ -75,93 +268,16 @@ def home():
         'status': 'running',
         'service': 'Audio Silence Cutter',
         'parameters': {
-            'min_silence_len': MIN_SILENCE_LEN,
-            'silence_thresh': SILENCE_THRESH,
-            'keep_silence': KEEP_SILENCE
+            'min_silence_len': 45,
+            'silence_thresh': -45,
+            'keep_silence': 30
         }
     })
 
-@app.route('/process-audio', methods=['POST'])
-def process_audio_endpoint():
-    """
-    Main endpoint for processing audio files
-    Accepts: multipart/form-data with 'audio' file
-    Returns: processed audio file
-    """
-    try:
-        # Check if file was uploaded
-        if 'audio' not in request.files:
-            return jsonify({'error': 'No audio file provided'}), 400
-        
-        file = request.files['audio']
-        
-        if file.filename == '':
-            return jsonify({'error': 'No file selected'}), 400
-        
-        if not allowed_file(file.filename):
-            return jsonify({'error': f'File type not allowed. Allowed types: {ALLOWED_EXTENSIONS}'}), 400
-        
-        # Get output format from request (default to mp3)
-        output_format = request.form.get('output_format', 'mp3').lower()
-        if output_format not in ALLOWED_EXTENSIONS:
-            output_format = 'mp3'
-        
-        # Save uploaded file temporarily
-        filename = secure_filename(file.filename)
-        temp_input = tempfile.NamedTemporaryFile(delete=False, suffix=f'.{filename.split(".")[-1]}')
-        file.save(temp_input.name)
-        
-        try:
-            # Process the audio
-            processed_audio = process_audio(temp_input.name, output_format)
-            
-            # Create temporary output file
-            temp_output = tempfile.NamedTemporaryFile(delete=False, suffix=f'.{output_format}')
-            processed_audio.export(temp_output.name, format=output_format)
-            
-            # Generate output filename
-            base_name = filename.rsplit('.', 1)[0]
-            output_filename = f"{base_name}_processed.{output_format}"
-            
-            # Return the processed file
-            return send_file(
-                temp_output.name,
-                as_attachment=True,
-                download_name=output_filename,
-                mimetype=f'audio/{output_format}'
-            )
-            
-        finally:
-            # Clean up temporary files
-            try:
-                os.unlink(temp_input.name)
-                if 'temp_output' in locals():
-                    os.unlink(temp_output.name)
-            except:
-                pass
-        
-    except Exception as e:
-        logger.error(f"Error in process_audio_endpoint: {str(e)}")
-        return jsonify({'error': f'Processing failed: {str(e)}'}), 500
-
-@app.route('/health', methods=['GET'])
-def health_check():
-    """
-    Health check endpoint for monitoring
-    """
-    return jsonify({'status': 'healthy'}), 200
-
-@app.errorhandler(413)
-def too_large(e):
-    return jsonify({'error': 'File too large. Maximum size is 50MB'}), 413
-
-@app.errorhandler(500)
-def internal_error(e):
-    return jsonify({'error': 'Internal server error'}), 500
-
 if __name__ == '__main__':
+    logger.info("Starting Silence Cutter API server...")
     # Create upload folder if it doesn't exist
-    os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+    os.makedirs('temp_uploads', exist_ok=True)
     
     # Run the app
     port = int(os.environ.get('PORT', 10000))
