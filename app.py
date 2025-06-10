@@ -178,8 +178,8 @@ def process_audio():
         logger.error(f"[{request_id}] Error saving input file: {str(e)}")
         return jsonify({'error': 'Error saving input file'}), 500
     
-    # Output will be MP3 instead of WAV
-    output_path = input_path.replace('.wav', '_processed.mp3')
+    # Output will be WAV to maintain quality
+    output_path = input_path.replace('.wav', '_processed.wav')
     
     try:
         # Process synchronously (no background thread)
@@ -188,14 +188,14 @@ def process_audio():
         # Process the audio
         processed_audio = cut_silence(input_path)
         
-        # Export as MP3 with size limit
-        export_mp3_with_size_limit(processed_audio, output_path)
+        # Export as WAV (high quality)
+        processed_audio.export(output_path, format="wav")
         logger.info(f"[{request_id}] Exported processed audio to: {output_path}")
         
         # Return the processed file directly
         if os.path.exists(output_path):
             file_size = os.path.getsize(output_path)
-            logger.info(f"[{request_id}] Returning MP3 file, size: {file_size/1024/1024:.2f}MB")
+            logger.info(f"[{request_id}] Returning WAV file, size: {file_size/1024/1024:.2f}MB")
             
             with open(output_path, 'rb') as f:
                 audio_data = f.read()
@@ -206,9 +206,9 @@ def process_audio():
             
             return Response(
                 audio_data,
-                mimetype='audio/mpeg',
+                mimetype='audio/wav',
                 headers={
-                    'Content-Disposition': f'attachment; filename={file.filename.rsplit(".", 1)[0]}_processed.mp3'
+                    'Content-Disposition': f'attachment; filename={file.filename.rsplit(".", 1)[0]}_processed.wav'
                 }
             )
         else:
