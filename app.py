@@ -289,7 +289,7 @@ def home():
         'parameters': {
             'min_silence_len': 45,
             'silence_thresh': -45,
-            'keep_silence': 30
+            'keep_silence': 23
         }
     })
 
