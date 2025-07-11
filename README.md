@@ -6,40 +6,60 @@ A Flask web service that processes audio files by removing silence gaps, designe
 
 - Accepts various audio formats (MP3, WAV, FLAC, M4A, AAC, OGG)
 - Removes silence from audio files using configurable parameters
-- Returns processed audio files
+- **Single file processing**: Returns processed audio file directly
+- **Batch processing**: Handles multiple files at once with robust error handling
+- Returns processed audio files (WAV format for single files, ZIP archive for multiple files)
+- Includes processing summary with detailed results for each file in batch mode
 - RESTful API suitable for integration with automation tools like n8n
 
 ## Configuration Parameters
 
-- **min_silence_len**: 45ms (minimum length of silence to be detected)
-- **silence_thresh**: -45dB (threshold below which audio is considered silence)
-- **keep_silence**: 30ms (amount of silence to keep around non-silent parts)
+- **min_silence_len**: 100ms (minimum length of silence to be detected)
+- **silence_thresh**: -30dB (threshold below which audio is considered silence)
+- **keep_silence**: 0ms (no artificial padding - removes all silence buffer)
 
 ## API Endpoints
 
 ### POST /process-audio
 
-Processes an audio file by removing silence gaps.
+Processes one or more audio files by removing silence gaps.
 
 **Request:**
 - Method: POST
 - Content-Type: multipart/form-data
 - Parameters:
-  - `audio` (file): The audio file to process
-  - `output_format` (optional string): Output format (mp3, wav, etc. - defaults to mp3)
+  - `file` (file): Single audio file to process (for backward compatibility)
+  - OR multiple files with any field names for batch processing
 
 **Response:**
-- Success: Returns the processed audio file
-- Error: JSON error message with appropriate HTTP status code
+- **Single file**: Returns the processed audio file directly (WAV format)
+- **Multiple files**: Returns a ZIP archive containing all successfully processed files plus a processing summary JSON
+- **Error**: JSON error message with appropriate HTTP status code
 
-**Example using curl:**
+**Single file example using curl:**
 ```bash
 curl -X POST \
-  -F "audio=@your_audio_file.mp3" \
-  -F "output_format=mp3" \
+  -F "file=@your_audio_file.mp3" \
   https://your-render-app.onrender.com/process-audio \
-  --output processed_audio.mp3
+  --output processed_audio.wav
 ```
+
+**Multiple files example using curl:**
+```bash
+curl -X POST \
+  -F "file1=@audio1.mp3" \
+  -F "file2=@audio2.wav" \
+  -F "file3=@audio3.flac" \
+  https://your-render-app.onrender.com/process-audio \
+  --output processed_audio_batch.zip
+```
+
+**Batch Processing Features:**
+- Processes multiple files concurrently
+- Continues processing even if some files fail
+- Returns ZIP archive with all successful files
+- Includes `processing_summary.json` with detailed results for each file
+- Robust error handling - failed files don't affect successful ones
 
 ### GET /
 
@@ -60,12 +80,21 @@ Health check endpoint for monitoring.
 
 In n8n, you can use the HTTP Request node with the following configuration:
 
+**Single file processing:**
 1. **Method**: POST
 2. **URL**: `https://your-render-app.onrender.com/process-audio`
 3. **Body**: Form-Data
-   - Key: `audio`, Type: File, Value: Your audio file
-   - Key: `output_format`, Type: Text, Value: `mp3` (optional)
-4. **Response**: Binary Data
+   - Key: `file`, Type: File, Value: Your audio file
+4. **Response**: Binary Data (WAV format)
+
+**Multiple file processing:**
+1. **Method**: POST
+2. **URL**: `https://your-render-app.onrender.com/process-audio`
+3. **Body**: Form-Data
+   - Key: `file1`, Type: File, Value: Your first audio file
+   - Key: `file2`, Type: File, Value: Your second audio file
+   - Add more files as needed with different key names
+4. **Response**: Binary Data (ZIP archive with processed files and summary)
 
 ## Local Development
 
