@@ -16,7 +16,7 @@ A Flask web service that processes audio files by removing silence gaps, designe
 
 - **min_silence_len**: 100ms (minimum length of silence to be detected)
 - **silence_thresh**: -30dB (threshold below which audio is considered silence)
-- **keep_silence**: 25ms (amount of silence to keep around non-silent parts)
+- **keep_silence**: 0ms (no artificial padding - removes all silence buffer)
 
 ## API Endpoints
 

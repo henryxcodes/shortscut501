@@ -29,7 +29,7 @@ jobs = {}
 # File size limit in bytes (50MB)
 MAX_FILE_SIZE = 50 * 1024 * 1024
 
-def cut_silence(audio_path, min_silence_len=100, silence_thresh=-30, keep_silence=25):
+def cut_silence(audio_path, min_silence_len=100, silence_thresh=-30, keep_silence=0):
     logger.info(f"Processing audio file: {audio_path}")
     logger.info(f"Parameters: min_silence_len={min_silence_len}ms, silence_thresh={silence_thresh}dB, keep_silence={keep_silence}ms")
     
@@ -408,7 +408,7 @@ def home():
         'parameters': {
             'min_silence_len': 100,
             'silence_thresh': -30,
-            'keep_silence': 25
+            'keep_silence': 0
         }
     })
 
