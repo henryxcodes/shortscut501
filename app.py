@@ -7,6 +7,8 @@ import logging
 from datetime import datetime
 import threading
 import uuid
+import zipfile
+import json
 
 # Configure logging
 logging.basicConfig(
@@ -152,77 +154,194 @@ def process_audio_background(job_id, input_path, output_path):
         if os.path.exists(output_path):
             os.unlink(output_path)
 
-@app.route('/process-audio', methods=['POST'])
-def process_audio():
-    request_id = datetime.now().strftime('%Y%m%d_%H%M%S')
-    logger.info(f"[{request_id}] Received new request")
+def process_single_file(file, request_id, file_index=""):
+    """Process a single audio file and return the result info"""
+    result = {
+        'filename': file.filename,
+        'success': False,
+        'error': None,
+        'output_path': None,
+        'file_size': 0
+    }
     
-    if 'file' not in request.files:
-        logger.error(f"[{request_id}] No file provided in request")
-        return jsonify({'error': 'No file provided'}), 400
+    file_log_id = f"{request_id}{file_index}"
+    logger.info(f"[{file_log_id}] Processing file: {file.filename}")
     
-    file = request.files['file']
-    if file.filename == '':
-        logger.error(f"[{request_id}] Empty filename")
-        return jsonify({'error': 'No file selected'}), 400
+    input_path = None
+    output_path = None
     
-    logger.info(f"[{request_id}] Processing file: {file.filename}")
-    
-    # Create temporary files for input and output
     try:
+        # Create temporary files for input and output
         with tempfile.NamedTemporaryFile(delete=False, suffix='.wav') as input_temp:
             file.save(input_temp.name)
             input_path = input_temp.name
-        logger.info(f"[{request_id}] Saved input file to: {input_path}")
-    except Exception as e:
-        logger.error(f"[{request_id}] Error saving input file: {str(e)}")
-        return jsonify({'error': 'Error saving input file'}), 500
-    
-    # Output will be WAV to maintain quality
-    output_path = input_path.replace('.wav', '_processed.wav')
-    
-    try:
-        # Process synchronously (no background thread)
-        logger.info(f"[{request_id}] Starting synchronous processing")
+        logger.info(f"[{file_log_id}] Saved input file to: {input_path}")
+        
+        # Output will be WAV to maintain quality
+        output_path = input_path.replace('.wav', '_processed.wav')
         
         # Process the audio
         processed_audio = cut_silence(input_path)
         
         # Export as WAV (high quality)
         processed_audio.export(output_path, format="wav")
-        logger.info(f"[{request_id}] Exported processed audio to: {output_path}")
+        logger.info(f"[{file_log_id}] Exported processed audio to: {output_path}")
         
-        # Return the processed file directly
         if os.path.exists(output_path):
             file_size = os.path.getsize(output_path)
-            logger.info(f"[{request_id}] Returning WAV file, size: {file_size/1024/1024:.2f}MB")
+            logger.info(f"[{file_log_id}] Successfully processed WAV file, size: {file_size/1024/1024:.2f}MB")
             
-            with open(output_path, 'rb') as f:
-                audio_data = f.read()
-            
-            # Clean up files
-            os.unlink(input_path)
-            os.unlink(output_path)
-            
-            return Response(
-                audio_data,
-                mimetype='audio/wav',
-                headers={
-                    'Content-Disposition': f'attachment; filename={file.filename.rsplit(".", 1)[0]}_processed.wav'
-                }
-            )
+            result['success'] = True
+            result['output_path'] = output_path
+            result['file_size'] = file_size
         else:
-            logger.error(f"[{request_id}] Processed file not found")
-            return jsonify({'error': 'Processed file not found'}), 500
-            
+            result['error'] = 'Processed file not found'
+            logger.error(f"[{file_log_id}] Processed file not found")
+    
     except Exception as e:
-        logger.error(f"[{request_id}] Error processing audio: {str(e)}")
+        error_msg = str(e)
+        result['error'] = error_msg
+        logger.error(f"[{file_log_id}] Error processing audio: {error_msg}")
+        
         # Clean up on error
-        if os.path.exists(input_path):
-            os.unlink(input_path)
-        if os.path.exists(output_path):
+        if output_path and os.path.exists(output_path):
             os.unlink(output_path)
-        return jsonify({'error': f'Processing failed: {str(e)}'}), 500
+    
+    finally:
+        # Always clean up input file
+        if input_path and os.path.exists(input_path):
+            os.unlink(input_path)
+    
+    return result
+
+@app.route('/process-audio', methods=['POST'])
+def process_audio():
+    request_id = datetime.now().strftime('%Y%m%d_%H%M%S')
+    logger.info(f"[{request_id}] Received new request")
+    
+    # Check if we have any files
+    if not request.files:
+        logger.error(f"[{request_id}] No files provided in request")
+        return jsonify({'error': 'No files provided'}), 400
+    
+    # Get all files (handles both single 'file' and multiple files)
+    files = []
+    if 'file' in request.files:
+        # Single file case (backward compatibility)
+        files = [request.files['file']]
+    else:
+        # Multiple files case - get all files from request
+        for key in request.files:
+            file_list = request.files.getlist(key)
+            files.extend(file_list)
+    
+    # Filter out empty filenames
+    files = [f for f in files if f.filename != '']
+    
+    if not files:
+        logger.error(f"[{request_id}] No valid files selected")
+        return jsonify({'error': 'No valid files selected'}), 400
+    
+    logger.info(f"[{request_id}] Processing {len(files)} file(s)")
+    
+    # Process all files
+    results = []
+    successful_files = []
+    
+    for i, file in enumerate(files):
+        file_index = f"_{i+1}" if len(files) > 1 else ""
+        result = process_single_file(file, request_id, file_index)
+        results.append(result)
+        
+        if result['success']:
+            successful_files.append(result)
+    
+    # Handle results
+    if not successful_files:
+        logger.error(f"[{request_id}] No files processed successfully")
+        error_summary = {
+            'error': 'No files processed successfully',
+            'details': [{'filename': r['filename'], 'error': r['error']} for r in results if not r['success']]
+        }
+        return jsonify(error_summary), 500
+    
+    # Single file - return directly (backward compatibility)
+    if len(files) == 1 and successful_files:
+        result = successful_files[0]
+        logger.info(f"[{request_id}] Returning single WAV file")
+        
+        with open(result['output_path'], 'rb') as f:
+            audio_data = f.read()
+        
+        # Clean up
+        os.unlink(result['output_path'])
+        
+        return Response(
+            audio_data,
+            mimetype='audio/wav',
+            headers={
+                'Content-Disposition': f'attachment; filename={result["filename"].rsplit(".", 1)[0]}_processed.wav'
+            }
+        )
+    
+    # Multiple files - create zip archive
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.zip') as zip_temp:
+            zip_path = zip_temp.name
+        
+        logger.info(f"[{request_id}] Creating zip archive with {len(successful_files)} processed files")
+        
+        with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+            # Add processed files to zip
+            for result in successful_files:
+                if result['success'] and os.path.exists(result['output_path']):
+                    processed_filename = f"{result['filename'].rsplit('.', 1)[0]}_processed.wav"
+                    zipf.write(result['output_path'], processed_filename)
+                    logger.info(f"[{request_id}] Added {processed_filename} to zip")
+            
+            # Add processing summary
+            summary = {
+                'total_files': len(files),
+                'successful_files': len(successful_files),
+                'failed_files': len(files) - len(successful_files),
+                'processing_summary': [
+                    {
+                        'filename': r['filename'],
+                        'success': r['success'],
+                        'error': r['error'],
+                        'file_size_mb': round(r['file_size'] / (1024*1024), 2) if r['success'] else 0
+                    } for r in results
+                ]
+            }
+            zipf.writestr('processing_summary.json', json.dumps(summary, indent=2))
+        
+        # Read zip file
+        with open(zip_path, 'rb') as f:
+            zip_data = f.read()
+        
+        # Clean up all temporary files
+        for result in successful_files:
+            if os.path.exists(result['output_path']):
+                os.unlink(result['output_path'])
+        os.unlink(zip_path)
+        
+        logger.info(f"[{request_id}] Returning zip archive with {len(successful_files)} processed files")
+        
+        return Response(
+            zip_data,
+            mimetype='application/zip',
+            headers={
+                'Content-Disposition': f'attachment; filename=processed_audio_{request_id}.zip'
+            }
+        )
+    
+    except Exception as e:
+        logger.error(f"[{request_id}] Error creating zip archive: {str(e)}")
+        # Clean up on error
+        for result in successful_files:
+            if os.path.exists(result['output_path']):
+                os.unlink(result['output_path'])
+        return jsonify({'error': f'Error creating zip archive: {str(e)}'}), 500
 
 @app.route('/job/<job_id>', methods=['GET'])
 def get_job_status(job_id):
