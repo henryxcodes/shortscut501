@@ -406,9 +406,9 @@ def home():
         'status': 'running',
         'service': 'Audio Silence Cutter',
         'parameters': {
-            'min_silence_len': 100,
-            'silence_thresh': -30,
-            'keep_silence': 30
+            'min_silence_len': 50,
+            'silence_thresh': -40,
+            'keep_silence': 33
         }
     })
 
